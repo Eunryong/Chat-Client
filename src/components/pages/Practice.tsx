@@ -1,12 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Box, Typography, Container, Paper, Button } from '@mui/material';
+import { Box, Typography, Container, Paper, Button, IconButton } from '@mui/material';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import * as faceLandmarksDetection from '@tensorflow-models/face-landmarks-detection';
 import * as tf from '@tensorflow/tfjs';
 import { io, Socket } from 'socket.io-client';
-import { FaceLandmarks, AvatarState, Keypoint } from '../../types/face';
+import { FaceLandmarks, AvatarState, Keypoint, SpeechRecognition, SpeechRecognitionEvent } from '../../types/face';
 import { renderAvatar } from '../../utils/avatarRenderer';
+import MicIcon from '@mui/icons-material/Mic';
+import MicOffIcon from '@mui/icons-material/MicOff';
+import RecordVoiceOverIcon from '@mui/icons-material/RecordVoiceOver';
+import VoiceOverOffIcon from '@mui/icons-material/VoiceOverOff';
 
 const Practice: React.FC = () => {
     const navigate = useNavigate();
@@ -22,75 +26,113 @@ const Practice: React.FC = () => {
         headRotation: { x: 0, y: 0, z: 0 },
     });
     const socketRef = useRef<Socket | null>(null);
-    const [peerConnection, setPeerConnection] = useState<RTCPeerConnection | null>(null);
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+    const [isAudioEnabled, setIsAudioEnabled] = useState(true);
+    const [transcript, setTranscript] = useState<string>('');
+    const [isListening, setIsListening] = useState(false);
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>(
         'disconnected'
     );
-    const [iceConnectionState, setIceConnectionState] = useState<string>('');
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+    const streamIdRef = useRef<string>('');
+    const [referenceText, setReferenceText] = useState<string>('안녕하세요, 반갑습니다.');
+
+    const setupAudioProcessing = (stream: MediaStream) => {
+        try {
+            console.log('=== 오디오 처리 설정 시작 ===');
+
+            // AudioContext 생성
+            audioContextRef.current = new AudioContext();
+            console.log('AudioContext 생성됨:', audioContextRef.current.state);
+
+            mediaStreamSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
+            console.log('MediaStreamSource 생성됨');
+
+            // ScriptProcessorNode 생성 (오디오 데이터 처리)
+            scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+            console.log('ScriptProcessor 생성됨, 버퍼 크기:', 4096);
+
+            // 오디오 데이터 처리 콜백
+            scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
+                if (!isAudioEnabled || !socketRef.current) {
+                    return;
+                }
+
+                try {
+                    const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+                    const audioDataArray = new Float32Array(inputData);
+
+                    // 데이터 유효성 검사
+                    if (audioDataArray.length === 0) {
+                        console.warn('빈 오디오 데이터 수신');
+                        return;
+                    }
+
+                    // 데이터 전송 전 로깅
+                    console.log('=== 오디오 데이터 전송 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('데이터 크기:', audioDataArray.length);
+                    console.log('첫 번째 샘플:', audioDataArray[0]);
+                    console.log('마지막 샘플:', audioDataArray[audioDataArray.length - 1]);
+
+                    // 오디오 데이터 전송
+                    socketRef.current.emit('audio_stream_data', {
+                        stream_id: streamIdRef.current,
+                        data: audioDataArray,
+                    });
+                } catch (error) {
+                    console.error('오디오 데이터 처리 중 오류:', error);
+                }
+            };
+
+            // 오디오 처리 연결
+            mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
+            scriptProcessorRef.current.connect(audioContextRef.current.destination);
+            console.log('오디오 처리 연결 완료');
+            console.log('=== 오디오 처리 설정 완료 ===');
+        } catch (error) {
+            console.error('오디오 처리 설정 중 오류:', error);
+        }
+    };
 
     useEffect(() => {
         const init = async () => {
             try {
                 setConnectionStatus('connecting');
+                console.log('=== 초기화 시작 ===');
 
-                // WebRTC 피어 연결 설정
-                const pc = new RTCPeerConnection({
-                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-                });
-                setPeerConnection(pc);
-
-                // ICE 연결 상태 모니터링
-                pc.oniceconnectionstatechange = () => {
-                    setIceConnectionState(pc.iceConnectionState);
-                    console.log('ICE 연결 상태:', pc.iceConnectionState);
-                };
-
-                // 비디오 스트림 설정
+                // 비디오와 오디오 스트림 설정
                 const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                    },
                     video: true,
-                    audio: true,
                 });
                 setLocalStream(stream);
+                console.log('미디어 스트림 획득 완료');
 
+                // 비디오 요소에 스트림 연결
                 if (videoRef.current) {
                     videoRef.current.srcObject = stream;
+                    console.log('비디오 요소에 스트림 연결 완료');
                 }
 
-                // 스트림을 피어 연결에 추가
-                stream.getTracks().forEach((track) => {
-                    pc.addTrack(track, stream);
-                });
-
-                // ICE 후보 생성 시 서버로 전송
-                pc.onicecandidate = (event) => {
-                    if (event.candidate && socketRef.current) {
-                        socketRef.current.emit('ice-candidate', {
-                            candidate: event.candidate,
-                        });
-                    }
-                };
-
-                // 원격 스트림 수신 시 처리
-                pc.ontrack = (event) => {
-                    if (videoRef.current) {
-                        videoRef.current.srcObject = event.streams[0];
-                    }
-                };
-
                 // WebSocket 연결
-                const socket = io('ws://localhost:8000/ws/audio', {
+                const socket = io('ws://localhost:8000', {
                     transports: ['websocket'],
                     upgrade: false,
                     reconnection: true,
                     reconnectionAttempts: 5,
                     reconnectionDelay: 1000,
                     timeout: 20000,
-                    path: '/ws/audio/socket.io',
-                    withCredentials: true, // CORS credentials 허용
-                    extraHeaders: {
-                        'Access-Control-Allow-Origin': 'http://localhost:3000', // React 개발 서버 주소
-                        'Access-Control-Allow-Credentials': 'true',
+                    path: '/ws/socket.io',
+                    query: {
+                        EIO: '4',
+                        transport: 'websocket',
                     },
                 });
                 socketRef.current = socket;
@@ -98,52 +140,65 @@ const Practice: React.FC = () => {
                 socket.on('connect', () => {
                     setIsConnected(true);
                     setConnectionStatus('connected');
-                    console.log('WebSocket 연결 성공');
+                    console.log('=== WebSocket 연결 성공 ===');
+                    console.log('연결 시간:', new Date().toISOString());
+                    console.log('소켓 ID:', socket.id);
+
+                    // 참조 텍스트 설정
+                    console.log('참조 텍스트 설정 시도:', referenceText);
+                    socket.emit('reference', {
+                        text: referenceText,
+                    });
                 });
 
-                socket.on('connect_error', (error) => {
-                    console.error('WebSocket 연결 오류:', error);
-                    setConnectionStatus('disconnected');
-                    // CORS 관련 오류인 경우 명시적으로 표시
-                    if (error.message.includes('CORS')) {
-                        console.error('CORS 오류 발생. 서버의 CORS 설정을 확인해주세요.');
+                // 참조 텍스트 설정 응답 처리
+                socket.on('reference_response', (response) => {
+                    console.log('=== 참조 텍스트 설정 응답 ===');
+                    console.log('응답:', response);
+
+                    if (response.status === 'success') {
+                        console.log('참조 텍스트 설정 성공');
+
+                        // 스트림 ID 생성
+                        streamIdRef.current = `stream_${Date.now()}`;
+                        console.log('스트림 ID 생성:', streamIdRef.current);
+
+                        // 오디오 스트림 시작
+                        console.log('오디오 스트림 시작 시도');
+                        socket.emit('audio_stream_start', {
+                            stream_id: streamIdRef.current,
+                        });
+
+                        // 오디오 처리 설정
+                        setupAudioProcessing(stream);
+                    } else {
+                        console.error('참조 텍스트 설정 실패:', response.error);
                     }
                 });
 
-                socket.on('disconnect', (reason) => {
-                    setIsConnected(false);
-                    setConnectionStatus('disconnected');
-                    console.log('WebSocket 연결 해제:', reason);
+                // 스트림 상태 이벤트 처리
+                socket.on('stream_status', (data) => {
+                    console.log('=== 스트림 상태 변경 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('상태:', data);
                 });
 
-                socket.on('error', (error) => {
-                    console.error('WebSocket 오류:', error);
-                    setConnectionStatus('disconnected');
+                // 스트림 에러 이벤트 처리
+                socket.on('stream_error', (error) => {
+                    console.error('=== 스트림 에러 ===');
+                    console.error('시간:', new Date().toISOString());
+                    console.error('에러:', error);
                 });
 
-                // 연결 시도
-                socket.connect();
+                // STT 결과 수신
+                socket.on('stt-result', (data: { text: string }) => {
+                    console.log('=== STT 결과 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('인식된 텍스트:', data.text);
+                    console.log('전체 트랜스크립트:', transcript + '\n' + data.text);
+                    console.log('================');
 
-                // 시그널링 메시지 처리
-                socket.on('offer', async (offer) => {
-                    if (pc) {
-                        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-                        const answer = await pc.createAnswer();
-                        await pc.setLocalDescription(answer);
-                        socket.emit('answer', answer);
-                    }
-                });
-
-                socket.on('answer', async (answer) => {
-                    if (pc) {
-                        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-                    }
-                });
-
-                socket.on('ice-candidate', async (candidate) => {
-                    if (pc) {
-                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                    }
+                    setTranscript((prev) => prev + '\n' + data.text);
                 });
 
                 // TensorFlow.js 모델 로드
@@ -231,15 +286,43 @@ const Practice: React.FC = () => {
         init();
 
         return () => {
-            if (socketRef.current) {
-                socketRef.current.disconnect();
+            console.log('=== 컴포넌트 정리 시작 ===');
+
+            // 오디오 처리 정리
+            if (scriptProcessorRef.current) {
+                scriptProcessorRef.current.disconnect();
+                console.log('ScriptProcessor 연결 해제');
             }
-            if (peerConnection) {
-                peerConnection.close();
+            if (mediaStreamSourceRef.current) {
+                mediaStreamSourceRef.current.disconnect();
+                console.log('MediaStreamSource 연결 해제');
             }
+            if (audioContextRef.current) {
+                audioContextRef.current.close();
+                console.log('AudioContext 종료');
+            }
+
+            // 스트림 정리
             if (localStream) {
-                localStream.getTracks().forEach((track) => track.stop());
+                localStream.getTracks().forEach((track) => {
+                    track.stop();
+                    console.log('미디어 트랙 정지:', track.kind);
+                });
             }
+
+            // 소켓 연결 종료
+            if (socketRef.current) {
+                if (streamIdRef.current) {
+                    socketRef.current.emit('audio_stream_end', {
+                        stream_id: streamIdRef.current,
+                    });
+                    console.log('오디오 스트림 종료 이벤트 전송');
+                }
+                socketRef.current.disconnect();
+                console.log('WebSocket 연결 종료');
+            }
+
+            console.log('=== 컴포넌트 정리 완료 ===');
         };
     }, []);
 
@@ -292,6 +375,18 @@ const Practice: React.FC = () => {
         ctx.stroke();
     };
 
+    // 오디오 토글 함수
+    const toggleAudio = () => {
+        if (localStream) {
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !audioTrack.enabled;
+                setIsAudioEnabled(audioTrack.enabled);
+                setIsListening(audioTrack.enabled);
+            }
+        }
+    };
+
     return (
         <Container maxWidth="md">
             <Box
@@ -312,36 +407,33 @@ const Practice: React.FC = () => {
                 <Box
                     sx={{
                         display: 'flex',
-                        gap: 2,
-                        alignItems: 'center',
+                        flexDirection: 'column',
+                        gap: 1,
                         mb: 2,
                     }}
                 >
-                    <Box
-                        sx={{
-                            width: 12,
-                            height: 12,
-                            borderRadius: '50%',
-                            backgroundColor:
-                                connectionStatus === 'connected'
-                                    ? '#4CAF50'
-                                    : connectionStatus === 'connecting'
-                                    ? '#FFC107'
-                                    : '#F44336',
-                        }}
-                    />
-                    <Typography variant="body1">
-                        {connectionStatus === 'connected'
-                            ? '연결됨'
-                            : connectionStatus === 'connecting'
-                            ? '연결 중...'
-                            : '연결 해제'}
-                    </Typography>
-                    {iceConnectionState && (
-                        <Typography variant="body2" color="text.secondary">
-                            (ICE: {iceConnectionState})
+                    <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+                        <Box
+                            sx={{
+                                width: 12,
+                                height: 12,
+                                borderRadius: '50%',
+                                backgroundColor:
+                                    connectionStatus === 'connected'
+                                        ? '#4CAF50'
+                                        : connectionStatus === 'connecting'
+                                        ? '#FFC107'
+                                        : '#F44336',
+                            }}
+                        />
+                        <Typography variant="body1">
+                            {connectionStatus === 'connected'
+                                ? '연결됨'
+                                : connectionStatus === 'connecting'
+                                ? '연결 중...'
+                                : '연결 해제'}
                         </Typography>
-                    )}
+                    </Box>
                 </Box>
 
                 <Paper
@@ -355,6 +447,24 @@ const Practice: React.FC = () => {
                         gap: 3,
                     }}
                 >
+                    {/* 참조 텍스트 표시 */}
+                    <Box sx={{ width: '100%' }}>
+                        <Typography variant="h6" gutterBottom>
+                            참조 텍스트
+                        </Typography>
+                        <Paper
+                            elevation={0}
+                            sx={{
+                                p: 2,
+                                bgcolor: '#f5f5f5',
+                                borderRadius: 1,
+                            }}
+                        >
+                            <Typography variant="body1">{referenceText}</Typography>
+                        </Paper>
+                    </Box>
+
+                    {/* 비디오 및 아바타 표시 */}
                     <Box sx={{ display: 'flex', gap: 4, width: '100%' }}>
                         {/* 사용자 비디오 */}
                         <Box sx={{ flex: 1, position: 'relative' }}>
@@ -393,6 +503,48 @@ const Practice: React.FC = () => {
                                 }}
                             />
                         </Box>
+                    </Box>
+
+                    {/* 오디오 컨트롤 */}
+                    <Box sx={{ width: '100%' }}>
+                        <Typography variant="h6" gutterBottom>
+                            오디오 설정
+                        </Typography>
+                        <Box
+                            sx={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 2,
+                                p: 2,
+                                border: '1px solid #ccc',
+                                borderRadius: 1,
+                            }}
+                        >
+                            <IconButton onClick={toggleAudio} color={isAudioEnabled ? 'primary' : 'default'}>
+                                {isAudioEnabled ? <MicIcon /> : <MicOffIcon />}
+                            </IconButton>
+                            <Typography>{isAudioEnabled ? '마이크 켜짐' : '마이크 꺼짐'}</Typography>
+                        </Box>
+                    </Box>
+
+                    {/* STT 결과 표시 */}
+                    <Box sx={{ width: '100%' }}>
+                        <Typography variant="h6" gutterBottom>
+                            음성 인식 결과
+                        </Typography>
+                        <Paper
+                            elevation={0}
+                            sx={{
+                                p: 2,
+                                bgcolor: '#f5f5f5',
+                                maxHeight: '200px',
+                                overflow: 'auto',
+                            }}
+                        >
+                            <Typography variant="body1" style={{ whiteSpace: 'pre-wrap' }}>
+                                {transcript || '인식된 텍스트가 여기에 표시됩니다...'}
+                            </Typography>
+                        </Paper>
                     </Box>
 
                     <Box sx={{ display: 'flex', gap: 2 }}>
