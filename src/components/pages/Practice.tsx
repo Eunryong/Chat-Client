@@ -38,13 +38,73 @@ const Practice: React.FC = () => {
     const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
     const streamIdRef = useRef<string>('');
     const [referenceText, setReferenceText] = useState<string>('안녕하세요, 반갑습니다.');
+    const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+
+    // WebRTC 설정
+    const configuration = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+    };
+
+    const setupWebRTC = async () => {
+        try {
+            console.log('=== WebRTC 설정 시작 ===');
+
+            // RTCPeerConnection 생성
+            peerConnectionRef.current = new RTCPeerConnection(configuration);
+            console.log('RTCPeerConnection 생성됨');
+
+            // ICE 후보 이벤트 처리
+            peerConnectionRef.current.onicecandidate = (event) => {
+                if (event.candidate && socketRef.current) {
+                    console.log('ICE 후보 전송:', event.candidate);
+                    socketRef.current.emit('ice_candidate', {
+                        candidate: event.candidate,
+                    });
+                }
+            };
+
+            // 연결 상태 변경 이벤트 처리
+            peerConnectionRef.current.onconnectionstatechange = () => {
+                console.log('WebRTC 연결 상태:', peerConnectionRef.current?.connectionState);
+                if (socketRef.current) {
+                    socketRef.current.emit('webrtc_state', {
+                        state: peerConnectionRef.current?.connectionState,
+                        peer_id: socketRef.current.id,
+                    });
+                }
+            };
+
+            // 로컬 스트림 추가
+            if (localStream) {
+                localStream.getTracks().forEach((track) => {
+                    if (peerConnectionRef.current) {
+                        peerConnectionRef.current.addTrack(track, localStream);
+                        console.log('트랙 추가:', track.kind);
+                    }
+                });
+            }
+
+            console.log('=== WebRTC 설정 완료 ===');
+        } catch (error) {
+            console.error('WebRTC 설정 중 오류:', error);
+        }
+    };
 
     const setupAudioProcessing = (stream: MediaStream) => {
         try {
             console.log('=== 오디오 처리 설정 시작 ===');
 
             // AudioContext 생성
-            audioContextRef.current = new AudioContext();
+            audioContextRef.current = new AudioContext({
+                sampleRate: 48000,
+                latencyHint: 'interactive',
+            });
             console.log('AudioContext 생성됨:', audioContextRef.current.state);
 
             mediaStreamSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
@@ -74,6 +134,7 @@ const Practice: React.FC = () => {
                     console.log('=== 오디오 데이터 전송 ===');
                     console.log('시간:', new Date().toISOString());
                     console.log('데이터 크기:', audioDataArray.length);
+                    console.log('샘플레이트:', audioContextRef.current?.sampleRate);
                     console.log('첫 번째 샘플:', audioDataArray[0]);
                     console.log('마지막 샘플:', audioDataArray[audioDataArray.length - 1]);
 
@@ -81,6 +142,8 @@ const Practice: React.FC = () => {
                     socketRef.current.emit('audio_stream_data', {
                         stream_id: streamIdRef.current,
                         data: audioDataArray,
+                        sampleRate: audioContextRef.current?.sampleRate,
+                        channelCount: 1,
                     });
                 } catch (error) {
                     console.error('오디오 데이터 처리 중 오류:', error);
@@ -103,52 +166,188 @@ const Practice: React.FC = () => {
                 setConnectionStatus('connecting');
                 console.log('=== 초기화 시작 ===');
 
-                // 비디오와 오디오 스트림 설정
-                const stream = await navigator.mediaDevices.getUserMedia({
+                // 오디오 제약 조건 설정
+                const audioConstraints = {
                     audio: {
                         echoCancellation: true,
                         noiseSuppression: true,
-                        autoGainControl: true,
+                        autoGainControl: false,
+                        channelCount: 1,
+                        sampleRate: 48000,
+                        sampleSize: 16,
                     },
                     video: true,
-                });
+                };
+
+                // 미디어 스트림 가져오기
+                const stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
                 setLocalStream(stream);
                 console.log('미디어 스트림 획득 완료');
+
+                // WebRTC 설정
+                await setupWebRTC();
+
+                // AudioContext 설정
+                audioContextRef.current = new AudioContext({
+                    sampleRate: 48000,
+                    latencyHint: 'interactive',
+                });
+                console.log('AudioContext 생성됨:', audioContextRef.current.state);
+
+                // 스트림을 AudioContext에 연결
+                mediaStreamSourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
+                console.log('MediaStreamSource 생성됨');
+
+                // 오디오 처리를 위한 프로세서 노드 생성
+                scriptProcessorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+                console.log('ScriptProcessor 생성됨, 버퍼 크기:', 4096);
+
+                // 오디오 데이터 처리 콜백
+                scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
+                    if (!isAudioEnabled || !socketRef.current) {
+                        return;
+                    }
+
+                    try {
+                        const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+                        const audioDataArray = new Float32Array(inputData);
+
+                        // 데이터 유효성 검사
+                        if (audioDataArray.length === 0) {
+                            console.warn('빈 오디오 데이터 수신');
+                            return;
+                        }
+
+                        // 데이터 전송 전 로깅
+                        console.log('=== 오디오 데이터 전송 ===');
+                        console.log('시간:', new Date().toISOString());
+                        console.log('데이터 크기:', audioDataArray.length);
+                        console.log('샘플레이트:', audioContextRef.current?.sampleRate);
+                        console.log('첫 번째 샘플:', audioDataArray[0]);
+                        console.log('마지막 샘플:', audioDataArray[audioDataArray.length - 1]);
+
+                        // 오디오 데이터 전송
+                        socketRef.current.emit('audio_stream_data', {
+                            stream_id: streamIdRef.current,
+                            data: audioDataArray,
+                            sampleRate: audioContextRef.current?.sampleRate,
+                            channelCount: 1,
+                        });
+                    } catch (error) {
+                        console.error('오디오 데이터 처리 중 오류:', error);
+                    }
+                };
+
+                // 오디오 처리 연결
+                mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
+                scriptProcessorRef.current.connect(audioContextRef.current.destination);
+                console.log('오디오 처리 연결 완료');
 
                 // 비디오 요소에 스트림 연결
                 if (videoRef.current) {
                     videoRef.current.srcObject = stream;
+                    videoRef.current.muted = true; // 비디오 요소 음소거
                     console.log('비디오 요소에 스트림 연결 완료');
                 }
 
                 // WebSocket 연결
-                const socket = io('ws://localhost:8000', {
+                const socket = io('http://localhost:8000', {
                     transports: ['websocket'],
-                    upgrade: false,
                     reconnection: true,
                     reconnectionAttempts: 5,
                     reconnectionDelay: 1000,
                     timeout: 20000,
-                    path: '/ws/socket.io',
+                    path: '/socket.io',
                     query: {
                         EIO: '4',
                         transport: 'websocket',
                     },
+                    withCredentials: false,
+                    forceNew: true,
+                    autoConnect: true,
+                    extraHeaders: {
+                        'Access-Control-Allow-Origin': '*',
+                    },
                 });
                 socketRef.current = socket;
 
+                // 연결 이벤트 핸들러
                 socket.on('connect', () => {
                     setIsConnected(true);
                     setConnectionStatus('connected');
                     console.log('=== WebSocket 연결 성공 ===');
                     console.log('연결 시간:', new Date().toISOString());
                     console.log('소켓 ID:', socket.id);
+                    console.log('연결 상태:', socket.connected);
+                    console.log('연결 옵션:', socket.io.opts);
 
-                    // 참조 텍스트 설정
-                    console.log('참조 텍스트 설정 시도:', referenceText);
-                    socket.emit('reference', {
-                        text: referenceText,
-                    });
+                    // 참조 텍스트 설정 (연결 성공 후 1초 지연)
+                    setTimeout(() => {
+                        if (referenceText && referenceText.trim()) {
+                            console.log('참조 텍스트 설정 시도:', referenceText);
+                            socket.emit('reference', {
+                                text: referenceText.trim(),
+                            });
+                        } else {
+                            console.error('참조 텍스트가 비어있습니다.');
+                            setConnectionStatus('disconnected');
+                        }
+                    }, 1000);
+                });
+
+                socket.on('connect_error', (error) => {
+                    console.error('=== WebSocket 연결 오류 ===');
+                    console.error('시간:', new Date().toISOString());
+                    console.error('오류:', error);
+                    console.error('연결 상태:', socket.connected);
+                    console.error('연결 옵션:', socket.io.opts);
+                    console.error('오류 상세:', error.message);
+                    console.error('오류 스택:', error.stack);
+                    setConnectionStatus('disconnected');
+                });
+
+                socket.on('error', (error) => {
+                    console.error('=== Socket.IO 오류 ===');
+                    console.error('시간:', new Date().toISOString());
+                    console.error('오류:', error);
+                    console.error('오류 상세:', error.message);
+                    console.error('오류 스택:', error.stack);
+                });
+
+                socket.on('disconnect', (reason) => {
+                    console.log('=== WebSocket 연결 해제 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('사유:', reason);
+                    console.log('연결 상태:', socket.connected);
+                    setConnectionStatus('disconnected');
+                });
+
+                socket.on('reconnect_attempt', (attemptNumber) => {
+                    console.log('=== WebSocket 재연결 시도 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('시도 횟수:', attemptNumber);
+                    setConnectionStatus('connecting');
+                });
+
+                socket.on('reconnect', (attemptNumber) => {
+                    console.log('=== WebSocket 재연결 성공 ===');
+                    console.log('시간:', new Date().toISOString());
+                    console.log('시도 횟수:', attemptNumber);
+                    console.log('연결 상태:', socket.connected);
+                    setConnectionStatus('connected');
+                });
+
+                socket.on('reconnect_error', (error) => {
+                    console.error('=== WebSocket 재연결 오류 ===');
+                    console.error('시간:', new Date().toISOString());
+                    console.error('오류:', error);
+                    setConnectionStatus('disconnected');
+                });
+
+                socket.on('reconnect_failed', () => {
+                    console.error('=== WebSocket 재연결 실패 ===');
+                    console.error('시간:', new Date().toISOString());
+                    setConnectionStatus('disconnected');
                 });
 
                 // 참조 텍스트 설정 응답 처리
@@ -173,6 +372,7 @@ const Practice: React.FC = () => {
                         setupAudioProcessing(stream);
                     } else {
                         console.error('참조 텍스트 설정 실패:', response.error);
+                        setConnectionStatus('disconnected');
                     }
                 });
 
@@ -188,6 +388,18 @@ const Practice: React.FC = () => {
                     console.error('=== 스트림 에러 ===');
                     console.error('시간:', new Date().toISOString());
                     console.error('에러:', error);
+
+                    // 참조 텍스트 관련 에러인 경우 재시도
+                    if (error.message === '참조 텍스트가 설정되지 않았습니다') {
+                        console.log('참조 텍스트 재설정 시도...');
+                        setTimeout(() => {
+                            if (referenceText && referenceText.trim()) {
+                                socket.emit('reference', {
+                                    text: referenceText.trim(),
+                                });
+                            }
+                        }, 1000);
+                    }
                 });
 
                 // STT 결과 수신
@@ -277,6 +489,42 @@ const Practice: React.FC = () => {
                 };
 
                 detectFace();
+
+                // WebRTC 시그널링 이벤트 처리
+                socket.on('offer', async (data) => {
+                    try {
+                        if (peerConnectionRef.current) {
+                            await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.offer));
+                            const answer = await peerConnectionRef.current.createAnswer();
+                            await peerConnectionRef.current.setLocalDescription(answer);
+                            socket.emit('answer', { answer });
+                        }
+                    } catch (error) {
+                        console.error('Offer 처리 중 오류:', error);
+                    }
+                });
+
+                socket.on('answer', async (data) => {
+                    try {
+                        if (peerConnectionRef.current) {
+                            await peerConnectionRef.current.setRemoteDescription(
+                                new RTCSessionDescription(data.answer)
+                            );
+                        }
+                    } catch (error) {
+                        console.error('Answer 처리 중 오류:', error);
+                    }
+                });
+
+                socket.on('ice-candidate', async (data) => {
+                    try {
+                        if (peerConnectionRef.current) {
+                            await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+                        }
+                    } catch (error) {
+                        console.error('ICE 후보 처리 중 오류:', error);
+                    }
+                });
             } catch (error) {
                 console.error('초기화 중 오류 발생:', error);
                 setConnectionStatus('disconnected');
@@ -287,6 +535,12 @@ const Practice: React.FC = () => {
 
         return () => {
             console.log('=== 컴포넌트 정리 시작 ===');
+
+            // WebRTC 연결 정리
+            if (peerConnectionRef.current) {
+                peerConnectionRef.current.close();
+                console.log('WebRTC 연결 종료');
+            }
 
             // 오디오 처리 정리
             if (scriptProcessorRef.current) {
